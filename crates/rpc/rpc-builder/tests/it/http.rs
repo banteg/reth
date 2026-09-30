@@ -544,6 +544,7 @@ where
         mode: Default::default(),
         after: None,
         count: None,
+        block_hash: None,
     };
 
     TraceApiClient::<TransactionRequest>::trace_raw_transaction(
@@ -580,6 +581,17 @@ where
     .is_none());
 
     TraceApiClient::<TransactionRequest>::trace_filter(client, trace_filter).await.unwrap();
+
+    let unknown_hash = TraceFilter::default().block_hash(B256::with_last_byte(1));
+    let err = TraceApiClient::<TransactionRequest>::trace_filter(client, unknown_hash.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, jsonrpsee::core::client::Error::Call(err) if err.code() == -32001));
+    let err =
+        TraceApiClient::<TransactionRequest>::trace_filter(client, unknown_hash.from_block(0))
+            .await
+            .unwrap_err();
+    assert!(is_invalid_params(&err));
 }
 
 async fn test_basic_web3_calls<C>(client: &C)

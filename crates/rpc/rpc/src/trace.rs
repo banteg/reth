@@ -10,7 +10,7 @@ use alloy_rpc_types_eth::{
     BlockOverrides, Index,
 };
 use alloy_rpc_types_trace::{
-    filter::TraceFilter,
+    filter::{TraceFilter, TraceFilterBlockOption},
     opcode::{BlockOpcodeGas, TransactionOpcodeGas},
     parity::*,
     tracerequest::TraceCallRequest,
@@ -363,25 +363,43 @@ where
     /// Returns all transaction traces that match the given filter.
     ///
     /// This is similar to [`Self::trace_block`] but only returns traces for transactions that match
-    /// the filter. Omitted range bounds default to the latest block.
+    /// the filter. Omitted range bounds default to the latest block. A `blockHash` selects exactly
+    /// that canonical block.
     pub async fn trace_filter(
         &self,
         filter: TraceFilter,
     ) -> Result<Vec<LocalizedTransactionTrace>, Eth::Error> {
         // We'll reuse the matcher across multiple blocks that are traced in parallel
         let matcher = Arc::new(filter.matcher());
-        let TraceFilter { from_block, to_block, mut after, count, .. } = filter;
+        let block_option =
+            filter.block_option().map_err(|err| EthApiError::InvalidParams(err.to_string()))?;
+        let TraceFilter { mut after, count, .. } = filter;
 
         let latest_block = self.provider().best_block_number().map_err(Eth::Error::from_eth_err)?;
-        let start = from_block.unwrap_or(latest_block);
-        if start > latest_block {
-            // can't trace that range
-            return Err(EthApiError::HeaderNotFound(start.into()).into());
-        }
-        let end = to_block.unwrap_or(latest_block);
-        if end > latest_block {
-            return Err(EthApiError::HeaderNotFound(end.into()).into());
-        }
+        let (start, end, block_hash) = match block_option {
+            TraceFilterBlockOption::Range { from_block, to_block } => {
+                let start = from_block.unwrap_or(latest_block);
+                if start > latest_block {
+                    // can't trace that range
+                    return Err(EthApiError::HeaderNotFound(start.into()).into());
+                }
+                let end = to_block.unwrap_or(latest_block);
+                if end > latest_block {
+                    return Err(EthApiError::HeaderNotFound(end.into()).into());
+                }
+                (start, end, None)
+            }
+            TraceFilterBlockOption::AtBlockHash(hash) => {
+                // A stored block above the best executed block can't be traced yet
+                let number = self
+                    .provider()
+                    .block_number(hash)
+                    .map_err(Eth::Error::from_eth_err)?
+                    .filter(|number| *number <= latest_block)
+                    .ok_or(EthApiError::HeaderNotFound(hash.into()))?;
+                (number, number, Some(hash))
+            }
+        };
 
         // Check if the requested range overlaps with pruned history (EIP-4444)
         let earliest_block =
@@ -430,6 +448,14 @@ where
                     Ok(blocks.into_iter().map(Arc::new).collect::<Vec<_>>())
                 })
                 .await?;
+
+            // `block_number` can still resolve a persisted block that an in-memory reorg replaced,
+            // and the chain may reorg after resolution: never return another block's traces.
+            if let Some(hash) = block_hash &&
+                blocks.first().is_none_or(|block| block.hash() != hash)
+            {
+                return Err(EthApiError::HeaderNotFound(hash.into()).into())
+            }
 
             let mut block_replays = futures::stream::iter(blocks)
                 .map(|block| {
@@ -873,10 +899,12 @@ mod tests {
     use alloy_consensus::Header;
     use alloy_genesis::Genesis;
     use alloy_rpc_types_eth::TransactionRequest;
+    use reth_chain_state::{ExecutedBlock, NewCanonicalChain};
     use reth_chainspec::ChainSpecBuilder;
     use reth_db_common::init::init_genesis;
     use reth_ethereum_primitives::{Block, BlockBody};
     use reth_evm_ethereum::EthEvmConfig;
+    use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
     use reth_network_api::noop::NoopNetwork;
     use reth_primitives_traits::Block as _;
     use reth_provider::{
@@ -884,9 +912,10 @@ mod tests {
         test_utils::{
             create_test_provider_factory_with_chain_spec, ExtendedAccount, MockEthProvider,
         },
-        BlockWriter, StageCheckpointWriter,
+        BlockWriter, CanonChainTracker, StageCheckpointWriter,
     };
     use reth_transaction_pool::test_utils::testing_pool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn trace_call_many_defaults_to_latest() {
@@ -1222,6 +1251,134 @@ mod tests {
                 TraceFilter { from_block: Some(0), to_block: Some(to_block), ..Default::default() };
             assert_eq!(trace_order(&api.trace_filter(filter).await.unwrap()), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn trace_filter_selects_canonical_block_hash() {
+        let coinbase = Address::repeat_byte(0x11);
+        let genesis = Genesis::default().with_gas_limit(30_000_000).with_coinbase(coinbase);
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        let genesis_hash = init_genesis(&factory).unwrap();
+        let block = |parent_hash, number, beneficiary| {
+            Block {
+                header: Header {
+                    parent_hash,
+                    number,
+                    beneficiary,
+                    gas_limit: 30_000_000,
+                    ..Default::default()
+                },
+                body: BlockBody::default(),
+            }
+            .seal_slow()
+            .try_recover()
+            .unwrap()
+        };
+        let replaced = block(genesis_hash, 1, Address::repeat_byte(0x22));
+        let canonical = block(genesis_hash, 1, coinbase);
+        let unexecuted = block(canonical.hash(), 2, coinbase);
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw.insert_block(&replaced).unwrap();
+        provider_rw.update_pipeline_stages(1, false).unwrap();
+        provider_rw.commit().unwrap();
+        // Replace block 1, then store block 2 without executing it.
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw.remove_blocks_above(0).unwrap();
+        provider_rw.commit().unwrap();
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw.insert_block(&canonical).unwrap();
+        provider_rw.insert_block(&unexecuted).unwrap();
+        provider_rw.update_pipeline_stages(1, false).unwrap();
+        provider_rw.commit().unwrap();
+
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let eth_api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        let api = TraceApi::new(eth_api, BlockingTaskGuard::new(1), EthConfig::default());
+        let by_hash = |hash| TraceFilter::default().block_hash(hash);
+
+        let traces = api.trace_filter(by_hash(canonical.hash())).await.unwrap();
+        assert_eq!(trace_order(&traces), [(1, None, true)]);
+        assert!(traces.iter().all(|trace| trace.block_hash == Some(canonical.hash())));
+        assert_eq!(
+            traces,
+            api.trace_filter(TraceFilter::default().from_block(1).to_block(1)).await.unwrap()
+        );
+        assert_eq!(api.trace_filter(by_hash(genesis_hash)).await.unwrap(), vec![]);
+        for filter in [
+            by_hash(canonical.hash()).to_address(vec![Address::ZERO]),
+            by_hash(canonical.hash()).after(1),
+            by_hash(canonical.hash()).count(0),
+        ] {
+            assert_eq!(api.trace_filter(filter).await.unwrap(), vec![]);
+        }
+
+        let module = api.into_rpc();
+        let call = async |filter: serde_json::Value| {
+            let request = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "trace_filter", "params": [filter],
+            });
+            let (response, _) = module.raw_json_request(&request.to_string(), 1).await.unwrap();
+            let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
+            match response.get("error") {
+                Some(error) => Err(error["code"].as_i64().unwrap()),
+                None => Ok(response["result"].clone()),
+            }
+        };
+        let traces = serde_json::to_value(traces).unwrap();
+        let (replaced, unexecuted) = (replaced.hash(), unexecuted.hash());
+        let unknown = B256::with_last_byte(1);
+        for (filter, expected) in [
+            (
+                json!({"blockHash": canonical.hash(), "fromBlock": null, "toBlock": null}),
+                Ok(traces.clone()),
+            ),
+            (json!({"blockHash": null, "fromBlock": "0x1", "toBlock": "0x1"}), Ok(traces.clone())),
+            (json!({"blockHash": canonical.hash(), "fromBlock": "0x1"}), Err(-32602)),
+            (json!({"blockHash": canonical.hash(), "toBlock": "0x1"}), Err(-32602)),
+            (json!({"blockHash": replaced}), Err(-32001)),
+            (json!({"blockHash": replaced, "count": 0}), Err(-32001)),
+            (json!({"blockHash": unexecuted}), Err(-32001)),
+            (json!({"blockHash": unexecuted, "count": 0}), Err(-32001)),
+            (json!({"blockHash": unknown, "count": 0}), Err(-32001)),
+        ] {
+            assert_eq!(call(filter.clone()).await, expected, "{filter}");
+        }
+
+        // Reorg block 1 in memory before the persisted block is removed: its hash still resolves
+        // to height 1, where the canonical chain now has another block.
+        let reorged = block(genesis_hash, 1, Address::repeat_byte(0x33));
+        let output = BlockExecutionOutput {
+            result: BlockExecutionResult {
+                receipts: vec![],
+                requests: Default::default(),
+                gas_used: 0,
+                blob_gas_used: 0,
+            },
+            state: Default::default(),
+        };
+        provider.canonical_in_memory_state().update_chain(NewCanonicalChain::Commit {
+            new: vec![ExecutedBlock::new(
+                Arc::new(reorged.clone()),
+                Arc::new(output),
+                Default::default(),
+            )],
+        });
+        provider.set_canonical_head(reorged.clone_sealed_header());
+        assert_eq!(provider.block_number(canonical.hash()).unwrap(), Some(1));
+
+        assert_eq!(call(json!({"blockHash": canonical.hash()})).await, Err(-32001));
+        let traces = call(json!({"blockHash": reorged.hash()})).await.unwrap();
+        assert_eq!(traces, call(json!({"fromBlock": "0x1", "toBlock": "0x1"})).await.unwrap());
+        assert_eq!(traces[0]["blockHash"], json!(reorged.hash()));
+        assert_eq!(traces[0]["action"]["author"], json!(Address::repeat_byte(0x33)));
     }
 
     fn localized_transaction_trace(
